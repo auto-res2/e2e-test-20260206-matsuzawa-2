@@ -1114,5 +1114,124 @@
     "experimental_code": "import re\nimport ast\nimport math\nimport multiprocessing as mp\nfrom datasets import load_dataset\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\nimport torch\n\nMODEL_NAME = \"Qwen/Qwen2.5-1.5B-Instruct\"\n\ntok = AutoTokenizer.from_pretrained(MODEL_NAME)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_NAME,\n    torch_dtype=torch.float32,\n    device_map=\"cpu\",\n)\nmodel.eval()\n\nnum_re = re.compile(r\"-?\\d+(?:\\.\\d+)?\")\ncode_fence_re = re.compile(r\"```(?:python)?\\n(.*?)```\", re.DOTALL | re.IGNORECASE)\n\n\ndef generate(prompt, max_new_tokens=256):\n    inputs = tok(prompt, return_tensors=\"pt\", truncation=True)\n    with torch.no_grad():\n        out = model.generate(\n            **inputs,\n            max_new_tokens=max_new_tokens,\n            do_sample=False,\n            pad_token_id=tok.eos_token_id,\n        )\n    return tok.decode(out[0], skip_special_tokens=True)\n\n\ndef extract_number(text):\n    m = num_re.findall(text)\n    return m[-1] if m else None\n\n\ndef zeroshot(question):\n    p = f\"Answer with only a number.\\nQuestion: {question}\\nAnswer:\"\n    return extract_number(generate(p, max_new_tokens=32))\n\n\ndef zeroshot_cot(question):\n    p1 = f\"Question: {question}\\nLet's think step by step.\"\n    rationale = generate(p1, max_new_tokens=256)\n    p2 = (\n        f\"Question: {question}\\nReasoning: {rationale}\\n\"\n        \"Return ONLY the final answer as a number:\"\n    )\n    ans = extract_number(generate(p2, max_new_tokens=16))\n    return ans, rationale\n\n\ndef mv_cot(question):\n    draft_ans, rationale = zeroshot_cot(question)\n    p = (\n        \"You are a careful checker. Verify the reasoning and correct mistakes. \"\n        \"Return ONLY the final numeric answer.\\n\"\n        f\"Question: {question}\\nProposed reasoning: {rationale}\\nAnswer:\"\n    )\n    out = generate(p, max_new_tokens=32)\n    ans = extract_number(out)\n    return ans if ans is not None else draft_ans\n\n\n# ---------------- sandbox execution ----------------\n\ndef _run_user_code(code_str):\n    safe_builtins = {\"abs\": abs, \"min\": min, \"max\": max, \"sum\": sum, \"round\": round}\n    env = {\"__builtins__\": safe_builtins, \"math\": math}\n    loc = {}\n    exec(code_str, env, loc)\n    if \"solve\" not in loc:\n        raise ValueError(\"No solve() function defined\")\n    return loc[\"solve\"]()\n\n\ndef run_code_safely(code_str, timeout_s=1.0):\n    q = mp.Queue()\n\n    def worker():\n        try:\n            res = _run_user_code(code_str)\n            q.put((\"ok\", res, None))\n        except Exception as e:\n            q.put((\"err\", None, repr(e)))\n\n    p = mp.Process(target=worker)\n    p.start()\n    p.join(timeout_s)\n    if p.is_alive():\n        p.terminate()\n        return \"timeout\", None, \"Timeout\"\n    return q.get() if not q.empty() else (\"err\", None, \"No output\")\n\n\n# ---------------- groundedness / anti-cheating ----------------\n\ndef groundedness_pass(code_str, question):\n    \"\"\"Cheap heuristic: code must (i) contain an arithmetic op, and (ii) reuse at least\n    one numeric literal from the question (to reduce constant-return cheating).\"\"\"\n    q_nums = set(num_re.findall(question))\n    try:\n        tree = ast.parse(code_str)\n    except SyntaxError:\n        return False, \"syntax\"\n\n    has_op = any(isinstance(n, (ast.BinOp, ast.UnaryOp)) for n in ast.walk(tree))\n    consts = []\n    for n in ast.walk(tree):\n        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):\n            consts.append(str(n.value))\n    uses_q_num = any(c in q_nums or c.rstrip(\".0\") in q_nums for c in consts)\n\n    if not has_op:\n        return False, \"no_op\"\n    if not uses_q_num and len(q_nums) > 0:\n        return False, \"no_question_number_used\"\n    return True, \"ok\"\n\n\ndef normalize_exec_result(x):\n    if isinstance(x, bool) or x is None:\n        return None\n    if isinstance(x, (int, float)):\n        return float(x)\n    # If model returned numeric string\n    try:\n        return float(str(x).strip())\n    except Exception:\n        return None\n\n\ndef same_number(a, b, tol=1e-6):\n    if a is None or b is None:\n        return False\n    if abs(a - b) <= tol:\n        return True\n    return False\n\n\n# ---------------- synthesis / repair ----------------\n\ndef _extract_code(text):\n    m = code_fence_re.search(text)\n    code = m.group(1).strip() if m else text.strip()\n    if \"def solve\" not in code:\n        # last resort\n        n = extract_number(code)\n        code = f\"def solve():\\n    return {n if n is not None else 'None'}\\n\"\n    return code\n\n\ndef synth_code_from_rationale(question, rationale):\n    p = (\n        \"Write MINIMAL Python to compute the numeric answer.\\n\"\n        \"Rules: define solve() returning int/float; no imports; no input(); no print.\\n\"\n        \"Use arithmetic with variables; avoid hard-coding the final answer alone.\\n\"\n        f\"Question: {question}\\nReasoning: {rationale}\\nPython:\"\n    )\n    return _extract_code(generate(p, max_new_tokens=256))\n\n\ndef synth_code_from_question(question):\n    p = (\n        \"Solve the math word problem by writing MINIMAL Python code.\\n\"\n        \"Rules: define solve() returning int/float; no imports; no input(); no print.\\n\"\n        \"Use arithmetic steps; do not just return a constant.\\n\"\n        f\"Question: {question}\\nPython:\"\n    )\n    return _extract_code(generate(p, max_new_tokens=256))\n\n\ndef repair_code(question, code_a, out_a, err_a, code_b, out_b, err_b, why_fail):\n    p = (\n        \"You are debugging. Make MINIMAL edits so that the code computes the correct answer.\\n\"\n        \"Prefer aligning with the independently-derived code if it runs.\\n\"\n        \"Return ONLY corrected Python code (no explanation).\\n\"\n        f\"Question: {question}\\n\"\n        f\"Failure reason: {why_fail}\\n\\n\"\n        f\"Code A:\\n```python\\n{code_a}\\n```\\nA_exec: {out_a} A_err: {err_a}\\n\\n\"\n        f\"Code B:\\n```python\\n{code_b}\\n```\\nB_exec: {out_b} B_err: {err_b}\\n\"\n        \"Corrected code A:\"\n    )\n    return _extract_code(generate(p, max_new_tokens=256))\n\n\n# ---------------- proposed method ----------------\n\ndef dc_emv_cot(question):\n    draft_ans, rationale = zeroshot_cot(question)\n\n    code_a = synth_code_from_rationale(question, rationale)\n    code_b = synth_code_from_question(question)\n\n    ok_a, why_a = groundedness_pass(code_a, question)\n    ok_b, why_b = groundedness_pass(code_b, question)\n\n    st_a, res_a, err_a = run_code_safely(code_a)\n    st_b, res_b, err_b = run_code_safely(code_b)\n\n    va = normalize_exec_result(res_a) if st_a == \"ok\" and ok_a else None\n    vb = normalize_exec_result(res_b) if st_b == \"ok\" and ok_b else None\n\n    # Certified if both valid and agree\n    if same_number(va, vb):\n        # prefer int-like formatting\n        v = va\n        return str(int(round(v))) if abs(v - round(v)) < 1e-9 else str(v)\n\n    # One counterexample-guided repair attempt (patch code_a)\n    why_fail = f\"agree_failed (A:{st_a}/{why_a} B:{st_b}/{why_b})\"\n    patched_a = repair_code(question, code_a, res_a, err_a, code_b, res_b, err_b, why_fail)\n    ok_p, why_p = groundedness_pass(patched_a, question)\n    st_p, res_p, err_p = run_code_safely(patched_a)\n    vp = normalize_exec_result(res_p) if st_p == \"ok\" and ok_p else None\n\n    # accept patched if it agrees with any valid other output\n    if vp is not None and vb is not None and same_number(vp, vb):\n        v = vp\n        return str(int(round(v))) if abs(v - round(v)) < 1e-9 else str(v)\n    if vp is not None and va is not None and same_number(vp, va):\n        v = vp\n        return str(int(round(v))) if abs(v - round(v)) < 1e-9 else str(v)\n\n    # fallback\n    return draft_ans\n\n\n# --- quick evaluation on GSM8K subset ---\nd = load_dataset(\"gsm8k\", \"main\", split=\"test[:200]\")\n\ndef gold_num(ex):\n    return ex[\"answer\"].split(\"####\")[-1].strip()\n\nacc = {\"zs\": 0, \"cot\": 0, \"mv\": 0, \"dc_emv\": 0}\nfor ex in d:\n    q = ex[\"question\"].strip()\n    g = gold_num(ex)\n\n    p_zs = zeroshot(q)\n    p_cot, _ = zeroshot_cot(q)\n    p_mv = mv_cot(q)\n    p_dc = dc_emv_cot(q)\n\n    acc[\"zs\"] += int(p_zs == g)\n    acc[\"cot\"] += int(p_cot == g)\n    acc[\"mv\"] += int(p_mv == g)\n    acc[\"dc_emv\"] += int(p_dc == g)\n\nn = len(d)\nprint({k + \"_accuracy\": v / n for k, v in acc.items()})\n",
     "expected_result": "Because DC-eMV-CoT demands **cross-compiled executable agreement** (and rejects ungrounded constant-return code), it should improve over single-compiler eMV-CoT specifically on cases where (a) the draft rationale is plausible but contains a small arithmetic slip, (b) rationale→code translation introduces an error, or (c) the model attempts to shortcut with ungrounded code.\n\nQuantitative expectations (greedy; `test[:200]`):\n- **GSM8K** (small instruct model):\n  - Zero-shot-CoT accuracy: ~0.18–0.25\n  - MV-CoT accuracy: ~0.22–0.30\n  - eMV-CoT accuracy (single compilation): ~0.28–0.38\n  - **DC-eMV-CoT accuracy: ~0.32–0.42** (≈ +2 to +5 points over eMV-CoT; +7 to +17 over Zero-shot-CoT)\n- **SVAMP**:\n  - eMV-CoT: ~0.35–0.50\n  - **DC-eMV-CoT: ~0.40–0.55**\n\nSecondary expectations:\n- Certified-answer coverage: 25–55% (higher on SVAMP).\n- Agreement rate among executable outputs (when both run): 60–85%.\n- Harm rate: lower than MV-CoT and eMV-CoT (target <2–4%) because the method abstains unless it has a certificate (execute ∧ agree ∧ grounded).\n- Overhead: +1 extra generation vs eMV-CoT; still far cheaper than self-consistency sampling.",
     "expected_conclusion": "DC-eMV-CoT makes CoT verification closer to a robust human strategy: **solve once, then independently re-solve in a different representation and only trust the result when they match**. Academically, it contributes a clearer notion of *metacognitive verification* as a **deterministic certificate based on agreement of two independently generated executable semantics**, enabling reproducible diagnostics (agreement, certified coverage, harm rate) rather than relying on subjective linguistic critique. Socially, it improves reliability and auditability for quantitative decision-support (education/finance/ops) in low-resource settings, while explicitly mitigating a practical safety failure mode of tool-augmented LLMs: runnable but ungrounded “cheating” code."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: given a grade-school math word problem in natural language, the model must produce a single final numeric answer (integer/decimal). The experiment compares inference-time verification strategies that aim to reduce arithmetic/translation errors by turning the problem (and/or its own rationale) into executable Python and using execution-based signals.\n\nPurpose: demonstrate that the proposed DC-eMV-CoT improves reliability over single-compilation executable verification by requiring agreement between two *independent semantic reconstructions* (rationale→code vs question→code) and rejecting ungrounded “cheating” constant-return code.\n\nWorkflow (per example; deterministic greedy decoding):\n1) Draft step-by-step reasoning (short CoT) + draft numeric answer.\n2) Trace compiler: compile the draft rationale into minimal straight-line Python (solve()->number).\n3) From-scratch compiler: independently compile the *question only* into minimal Python (solve()->number), ignoring the rationale.\n4) Execute both codes in a sandbox and certify the executed answer only if: (i) both execute, (ii) outputs agree within tolerance, and (iii) both pass a lightweight groundedness/anti-cheating AST heuristic.\n5) Optional one-round repair: if certification fails, provide only the disagreement/error signal and ask the model to minimally patch one program; re-run once.\n6) Output: return the certified executed answer when available; otherwise fall back to the draft answer.\n\nExperiment scale tuned to the provided Runner (H200 140GB VRAM):\n- Use a single local open-weight model (Qwen3-4B) in bf16 on GPU.\n- Development run: GSM8K test[:200] for prompt/heuristic stabilization.\n- Main report run: GSM8K test[:500] (or full test=1319 if time allows); this keeps total generations bounded (≈3–4 calls/example) and comfortably fits GPU memory/throughput.\n- All decoding is greedy with capped max_new_tokens to keep latency low and reproducible.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Primary metric: final-answer exact correctness (numerical).\n\nCorrectness criteria:\n- Parse the model’s final output into a number (int/float) using a robust regex and normalization.\n- Parse the gold answer from GSM8K (substring after '####') into a number.\n- A prediction is correct iff:\n  1) both parse to numbers, and\n  2) either they are exactly equal as integers OR |pred-gold| <= max(1e-6, 1e-6*|gold|) after float conversion.\n  This handles minor floating formatting while preserving strictness.\n\nCalculation method:\n- accuracy = (1/N) * Σ_i 𝟙[correct_i].\n\nTask appropriateness:\n- GSM8K is a numeric word-problem benchmark; correctness is inherently numeric rather than free-form text, so numeric exact/tolerance matching reflects the intended objective.\n\nRelevant visualizations:\n- Bar chart of accuracy by method (baseline vs proposed).\n- Paired-difference plot (per-item correctness change: baseline correct/incorrect vs proposed correct/incorrect)."
+      },
+      {
+        "name": "certified_coverage",
+        "description": "Fraction of examples where DC-eMV-CoT returns a *certified executed answer* (instead of falling back to the draft answer).\n\nCorrectness criteria:\n- 'Certified' means: both compiled programs executed successfully, their numeric outputs agree within tolerance, and both pass groundedness checks; OR certification after the single repair attempt.\n\nCalculation method:\n- coverage = (#certified_examples)/N.\n\nTask appropriateness:\n- The proposed contribution is a deterministic correctness signal (certificate). Coverage measures how often the method is able to produce such a certificate under bounded latency.\n\nRelevant visualizations:\n- Stacked bar showing certified vs fallback fractions.\n- Histogram of certification failure reasons (exec error vs disagreement vs groundedness)."
+      },
+      {
+        "name": "agreement_rate_when_both_valid",
+        "description": "How often the two independent compilations agree *conditional on both producing valid runnable grounded code*.\n\nCorrectness criteria:\n- A program is 'valid' if it (i) parses, (ii) passes groundedness heuristic, and (iii) executes within timeout producing a numeric output.\n- Agreement is true if outputs match within tolerance.\n\nCalculation method:\n- agreement_rate = (#examples with valid_A ∧ valid_B ∧ agree(A,B)) / (#examples with valid_A ∧ valid_B).\n\nTask appropriateness:\n- Directly measures the central hypothesis: agreement of independent semantic reconstructions is a reliable correctness signal and a useful abstention criterion.\n\nRelevant visualizations:\n- Reliability diagram: accuracy vs agreement bucket (agree vs disagree).\n- Scatter plot of (output_A, output_B) for disagreements (optional; clipped)."
+      },
+      {
+        "name": "execution_success_rate_per_compiler",
+        "description": "Execution success rate for each compiler channel separately (Trace compiler A and From-scratch compiler B).\n\nCorrectness criteria:\n- Success if the generated code (i) passes syntax parse, (ii) executes within timeout, and (iii) returns a numeric value.\n\nCalculation method:\n- exec_rate_A = (#success_A)/N; exec_rate_B = (#success_B)/N.\n\nTask appropriateness:\n- Disentangles failures due to code generation/translation from reasoning failures. DC-eMV-CoT claims to mitigate 'single point of failure' by adding redundancy; these rates quantify each channel’s brittleness.\n\nRelevant visualizations:\n- Side-by-side bars: exec_rate_A vs exec_rate_B.\n- Error-type pie/bar (syntax error, runtime error, timeout, non-numeric)."
+      },
+      {
+        "name": "harm_rate",
+        "description": "How often the verification method makes a previously correct draft answer become incorrect.\n\nCorrectness criteria:\n- Consider the *draft* answer from Zero-shot-CoT as the pre-verification reference.\n- Harm occurs if: draft is correct AND final method output is incorrect.\n\nCalculation method:\n- harm_rate = (#harm_examples)/N.\n\nTask appropriateness:\n- Verification should be conservative; a key claimed benefit of certification is reducing incorrect overrides. Harm rate captures regressions and safety risk.\n\nRelevant visualizations:\n- Two-by-two transition matrix (draft correct/incorrect vs final correct/incorrect).\n- Bar chart comparing harm_rate across methods."
+      }
+    ],
+    "models_to_use": [
+      "Qwen/Qwen3-4B (4B parameters)"
+    ],
+    "datasets_to_use": [
+      "openai/gsm8k (main config)"
+    ],
+    "proposed_method": {
+      "method_name": "DC-eMV-CoT (Dual-Compilation Executable Metacognitive Verification CoT)",
+      "description": "Training-free, low-latency verification for math word problems: generate (1) a draft CoT+answer, then compile into two independent minimal Python solvers (rationale→code and question→code). Execute both in a sandbox and accept the executed answer only when both channels execute, agree within tolerance, and pass an AST-based anti-cheating groundedness heuristic; optionally do one counterexample-guided repair round using only disagreement/error signals. Novelty: replaces single-channel executability with agreement-of-independent semantic reconstructions as a deterministic correctness certificate, improving robustness to translation errors and constant-return cheating.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "exec_timeout_s",
+            "distribution_type": "uniform",
+            "low": 0.5,
+            "high": 3.0
+          },
+          {
+            "param_name": "float_tol",
+            "distribution_type": "loguniform",
+            "low": 1e-08,
+            "high": 0.0001
+          },
+          {
+            "param_name": "max_new_tokens_cot",
+            "distribution_type": "int",
+            "low": 128.0,
+            "high": 384.0
+          },
+          {
+            "param_name": "max_new_tokens_code",
+            "distribution_type": "int",
+            "low": 128.0,
+            "high": 384.0
+          },
+          {
+            "param_name": "groundedness_mode",
+            "distribution_type": "categorical",
+            "choices": [
+              "literal_from_question+has_op (default)",
+              "has_op_only (ablation-like)",
+              "literal_or_varname_overlap+has_op"
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "eMV-CoT (Single-Compilation Executable Metacognitive Verification)",
+        "description": "Training-free baseline executable verification: generate draft CoT+answer, compile the rationale into a single minimal Python solver, execute it in a sandbox, and (optionally) perform one repair round if execution fails or output is non-numeric. Final answer is the executed result if available; otherwise fall back to the draft answer. This is the closest baseline that DC-eMV-CoT extends by adding a second independent compilation channel plus agreement and groundedness certification.",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "exec_timeout_s",
+              "distribution_type": "uniform",
+              "low": 0.5,
+              "high": 3.0
+            },
+            {
+              "param_name": "max_new_tokens_cot",
+              "distribution_type": "int",
+              "low": 128.0,
+              "high": 384.0
+            },
+            {
+              "param_name": "max_new_tokens_code",
+              "distribution_type": "int",
+              "low": 128.0,
+              "high": 384.0
+            },
+            {
+              "param_name": "use_repair_round",
+              "distribution_type": "categorical",
+              "choices": [
+                0,
+                1
+              ]
+            }
+          ]
+        }
+      }
+    ]
   }
 }
