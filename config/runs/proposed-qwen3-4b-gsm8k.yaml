@@ -1,0 +1,60 @@
+run_id: proposed-qwen3-4b-gsm8k
+method: DC-eMV-CoT (Dual-Compilation Executable Metacognitive Verification CoT)
+model:
+  name: Qwen/Qwen3-4B
+  dtype: bf16
+  device: cuda
+  max_new_tokens_cot: 256
+  max_new_tokens_code: 256
+  decoding: greedy
+dataset:
+  name: openai/gsm8k
+  config: main
+  split: test[:200]
+  question_field: question
+  answer_field: answer
+  preprocessing:
+    strip_whitespace: true
+    answer_extraction: "split_after_####"
+training:
+  learning_rate: 1.0e-5
+  batch_size: 1
+  epochs: 1
+  optimizer: adamw
+  warmup_steps: 0
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  seed: 42
+method_params:
+  exec_timeout_s: 1.0
+  float_tol: 1.0e-6
+  groundedness_mode: literal_from_question+has_op (default)
+  use_repair_round: true
+  sandbox:
+    allowed_builtins: [abs, min, max, sum, round]
+    timeout_s: 1.0
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: exec_timeout_s
+      distribution_type: uniform
+      low: 0.5
+      high: 3.0
+    - param_name: float_tol
+      distribution_type: loguniform
+      low: 1.0e-8
+      high: 1.0e-4
+    - param_name: max_new_tokens_cot
+      distribution_type: int
+      low: 128
+      high: 384
+    - param_name: max_new_tokens_code
+      distribution_type: int
+      low: 128
+      high: 384
+    - param_name: groundedness_mode
+      distribution_type: categorical
+      choices:
+        - literal_from_question+has_op (default)
+        - has_op_only (ablation-like)
+        - literal_or_varname_overlap+has_op

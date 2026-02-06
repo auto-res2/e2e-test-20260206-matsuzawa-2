@@ -1,0 +1,126 @@
+defaults:
+  - _self_
+  - runs@_global_: ${run}
+
+run: ???
+run_id: ${run}
+mode: full
+results_dir: .
+
+wandb:
+  entity: airas
+  project: 2026-02-06
+  mode: online
+
+model:
+  name: ""
+  dtype: bf16
+  device: cuda
+  decoding: greedy
+  max_new_tokens_zs: 64
+  max_new_tokens_answer: 32
+  max_new_tokens_mv: 64
+  max_new_tokens_cot: 256
+  max_new_tokens_code: 256
+  max_new_tokens_repair: 256
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 50
+  num_beams: 1
+
+dataset:
+  name: ""
+  config: null
+  split: ""
+  question_field: ""
+  answer_field: ""
+  preprocessing:
+    strip_whitespace: true
+    answer_extraction: null
+
+prompts:
+  system: "You are a careful math solver."
+  zero_shot: |
+    Answer with only a number.
+    Question: {question}
+    Answer:
+  zero_shot_cot: |
+    Question: {question}
+    Let's think step by step.
+  zero_shot_answer: |
+    Question: {question}
+    Reasoning: {rationale}
+    Return ONLY the final answer as a number.
+  mv_cot: |
+    You are a careful checker. Verify the reasoning and correct mistakes.
+    Return ONLY the final numeric answer.
+    Question: {question}
+    Proposed reasoning: {rationale}
+    Answer:
+  compile_rationale: |
+    Write MINIMAL Python to compute the numeric answer.
+    Rules: define solve() returning int/float; no imports; no input(); no print.
+    Use arithmetic with variables; avoid hard-coding the final answer alone.
+    Question: {question}
+    Reasoning: {rationale}
+    Python:
+  compile_question: |
+    Solve the math word problem by writing MINIMAL Python code.
+    Rules: define solve() returning int/float; no imports; no input(); no print.
+    Use arithmetic steps; do not just return a constant.
+    Question: {question}
+    Python:
+  repair: |
+    You are debugging. Make MINIMAL edits so that the code computes the correct answer.
+    Prefer aligning with the independently-derived code if it runs.
+    Return ONLY corrected Python code (no explanation).
+    Question: {question}
+    Failure reason: {why_fail}
+
+    Code A:
+    ```python
+    {code_a}
+    ```
+    A_exec: {out_a} A_err: {err_a}
+
+    Code B:
+    ```python
+    {code_b}
+    ```
+    B_exec: {out_b} B_err: {err_b}
+    Corrected code A:
+
+method_params:
+  exec_timeout_s: 1.0
+  float_tol: 1.0e-6
+  groundedness_mode: literal_from_question+has_op (default)
+  use_repair_round: true
+  sandbox:
+    allowed_builtins: [abs, min, max, sum, round]
+    timeout_s: 1.0
+
+training:
+  learning_rate: 1.0e-5
+  batch_size: 1
+  epochs: 1
+  optimizer: adamw
+  warmup_steps: 0
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  max_batches: -1
+  max_label_tokens: 64
+  update_model: false
+  seed: 42
+
+optuna:
+  eval_samples: 50
+  n_trials: 0
+  search_spaces: []
+
+hydra:
+  run:
+    dir: ${results_dir}/hydra/${run_id}
+  output_subdir: null
+  job:
+    chdir: true
